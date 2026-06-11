@@ -1,5 +1,6 @@
 import { Request, Response, NextFunction } from 'express'
-import { supabase } from '../supabase'
+import { queryOne, uuidParam } from '../db'
+import { verifyAccessToken } from '../auth/jwt'
 
 export interface AuthRequest extends Request {
   user?: {
@@ -14,53 +15,25 @@ export async function authenticate(req: AuthRequest, res: Response, next: NextFu
   const token = req.headers.authorization?.replace('Bearer ', '')
   if (!token) return res.status(401).json({ error: 'No token provided' })
 
-  const {
-    data: { user },
-    error,
-  } = await supabase.auth.getUser(token)
-
-  if (error || !user) return res.status(401).json({ error: 'Invalid or expired token' })
-
-  const { data: profile } = await supabase
-    .from('profiles')
-    .select('role, employee_status')
-    .eq('id', user.id)
-    .single()
-
-  const metadataRole =
-    typeof user.user_metadata?.role === 'string' ? user.user_metadata.role : undefined
-  let role = profile?.role ?? metadataRole ?? 'customer'
-
-  if (metadataRole === 'superadmin') {
-    role = 'superadmin'
-    const name =
-      typeof user.user_metadata?.name === 'string' && user.user_metadata.name.trim()
-        ? user.user_metadata.name.trim()
-        : user.email?.split('@')[0] || 'Super Admin'
-    if (!profile) {
-      await supabase.from('profiles').upsert(
-        {
-          id: user.id,
-          name,
-          role: 'superadmin',
-          employee_status: null,
-          updated_at: new Date().toISOString(),
-        },
-        { onConflict: 'id' }
-      )
-    } else if (profile.role !== 'superadmin') {
-      await supabase
-        .from('profiles')
-        .update({ role: 'superadmin', employee_status: null, updated_at: new Date().toISOString() })
-        .eq('id', user.id)
-    }
+  let claims
+  try {
+    claims = verifyAccessToken(token)
+  } catch {
+    return res.status(401).json({ error: 'Invalid or expired token' })
   }
 
+  // Role/status are read fresh from the DB so an admin demotion or employee
+  // approval takes effect on the next request without re-issuing the token.
+  const profile = await queryOne<{ role: string; employee_status: string | null }>(
+    'SELECT role, employee_status FROM dbo.profiles WHERE id = @id',
+    { id: uuidParam(claims.sub) }
+  )
+
   req.user = {
-    id: user.id,
-    email: user.email!,
-    role,
-    employeeStatus: profile?.employee_status,
+    id: claims.sub,
+    email: claims.email,
+    role: profile?.role ?? claims.role ?? 'customer',
+    employeeStatus: profile?.employee_status ?? undefined,
   }
   next()
 }

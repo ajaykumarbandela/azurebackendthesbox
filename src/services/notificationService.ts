@@ -1,6 +1,7 @@
 import twilio from 'twilio'
+import { randomUUID } from 'crypto'
 import { Expo } from 'expo-server-sdk'
-import { supabase } from '../supabase'
+import { query, queryOne, uuidParam } from '../db'
 import { logger } from '../logger'
 import { notificationQueue } from './queueService'
 
@@ -23,7 +24,11 @@ async function sendExpoNotification(
 }
 
 async function saveInAppNotification(userId: string, title: string, body: string): Promise<void> {
-  await supabase.from('notifications').insert({ user_id: userId, title, body })
+  await query(
+    `INSERT INTO dbo.notifications (id, user_id, title, body, [read], created_at)
+     VALUES (@id, @uid, @title, @body, 0, SYSDATETIMEOFFSET())`,
+    { id: uuidParam(randomUUID()), uid: uuidParam(userId), title, body }
+  )
 }
 
 export function notifyAdminOrderPlaced(order: {
@@ -32,7 +37,6 @@ export function notifyAdminOrderPlaced(order: {
   order_items?: unknown[]
 }): void {
   notificationQueue.enqueue(async () => {
-    // WhatsApp via Twilio
     try {
       await twilioClient.messages.create({
         from: process.env.TWILIO_WHATSAPP_FROM!,
@@ -43,15 +47,9 @@ export function notifyAdminOrderPlaced(order: {
       logger.error({ err }, 'WhatsApp notification failed')
     }
 
-    // Expo push to admin device
-    const { data: admin } = await supabase
-      .from('profiles')
-      .select('fcm_token')
-      .eq('role', 'admin')
-      .not('fcm_token', 'is', null)
-      .limit(1)
-      .single()
-
+    const admin = await queryOne<{ fcm_token: string | null }>(
+      "SELECT TOP 1 fcm_token FROM dbo.profiles WHERE role = 'admin' AND fcm_token IS NOT NULL"
+    )
     if (admin?.fcm_token) {
       await sendExpoNotification(
         admin.fcm_token,
@@ -70,12 +68,10 @@ export function notifyCustomerStatusUpdate(userId: string, orderId: string, stat
 
     await saveInAppNotification(userId, title, body)
 
-    const { data: profile } = await supabase
-      .from('profiles')
-      .select('fcm_token')
-      .eq('id', userId)
-      .single()
-
+    const profile = await queryOne<{ fcm_token: string | null }>(
+      'SELECT fcm_token FROM dbo.profiles WHERE id = @id',
+      { id: uuidParam(userId) }
+    )
     if (profile?.fcm_token) {
       await sendExpoNotification(profile.fcm_token, title, body, { orderId, screen: 'OrderTracking' })
     }
@@ -91,12 +87,10 @@ export function notifyEmployeeApproval(userId: string, approved: boolean): void 
 
     await saveInAppNotification(userId, title, body)
 
-    const { data: profile } = await supabase
-      .from('profiles')
-      .select('fcm_token')
-      .eq('id', userId)
-      .single()
-
+    const profile = await queryOne<{ fcm_token: string | null }>(
+      'SELECT fcm_token FROM dbo.profiles WHERE id = @id',
+      { id: uuidParam(userId) }
+    )
     if (profile?.fcm_token) {
       await sendExpoNotification(profile.fcm_token, title, body)
     }

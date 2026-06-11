@@ -1,51 +1,26 @@
 import { Response } from 'express'
-import { supabase } from '../supabase'
+import { randomUUID } from 'crypto'
+import { query, queryOne, uuidParam } from '../db'
+import { hashPassword } from '../auth/password'
 import { AuthRequest } from '../middleware/auth'
 
-const isBanned = (u?: { banned_until?: string | null } | null) =>
-  !!u?.banned_until && new Date(u.banned_until).getTime() > Date.now()
-
-function enrichAdmin(
-  profile: Record<string, unknown>,
-  authUser?: { email?: string; banned_until?: string | null }
-) {
-  return {
-    ...profile,
-    email: authUser?.email ?? null,
-    active: !isBanned(authUser),
-  }
-}
+// Email + active now live on profiles directly (Supabase auth.users is gone).
+const adminCols = 'id, name, phone, role, email, active, created_at, updated_at'
 
 export async function listAdmins(_req: AuthRequest, res: Response) {
-  const { data: profiles, error } = await supabase
-    .from('profiles')
-    .select('id, name, phone, role, created_at, updated_at')
-    .eq('role', 'admin')
-    .order('created_at', { ascending: false })
-
-  if (error) return res.status(500).json({ error: error.message })
-
-  const { data: authList } = await supabase.auth.admin.listUsers({ page: 1, perPage: 1000 })
-  const authMap = new Map((authList?.users ?? []).map((u) => [u.id, u]))
-
-  const data = (profiles ?? []).map((p) => enrichAdmin(p, authMap.get(p.id)))
+  const data = await query(
+    `SELECT ${adminCols} FROM dbo.profiles WHERE role = 'admin' ORDER BY created_at DESC`
+  )
   res.json({ data })
 }
 
 export async function getAdmin(req: AuthRequest, res: Response) {
-  const { id } = req.params
-
-  const { data: profile, error } = await supabase
-    .from('profiles')
-    .select('id, name, phone, role, created_at, updated_at')
-    .eq('id', id)
-    .eq('role', 'admin')
-    .single()
-
-  if (error || !profile) return res.status(404).json({ error: 'Admin not found' })
-
-  const { data: authUser } = await supabase.auth.admin.getUserById(id)
-  res.json(enrichAdmin(profile, authUser?.user ?? undefined))
+  const profile = await queryOne(
+    `SELECT ${adminCols} FROM dbo.profiles WHERE id = @id AND role = 'admin'`,
+    { id: uuidParam(req.params.id) }
+  )
+  if (!profile) return res.status(404).json({ error: 'Admin not found' })
+  res.json(profile)
 }
 
 export async function createAdmin(req: AuthRequest, res: Response) {
@@ -58,31 +33,20 @@ export async function createAdmin(req: AuthRequest, res: Response) {
     return res.status(400).json({ error: 'password must be at least 6 characters' })
   }
 
-  const { data, error } = await supabase.auth.admin.createUser({
-    email,
-    password,
-    email_confirm: true,
-    user_metadata: { name, phone: phone ?? null, role: 'admin' },
-  })
+  const existing = await queryOne<{ id: string }>('SELECT id FROM dbo.profiles WHERE email = @email', { email })
+  if (existing) return res.status(400).json({ error: 'A user with this email already exists' })
 
-  if (error) return res.status(400).json({ error: error.message })
-
-  const { data: profile, error: profileErr } = await supabase
-    .from('profiles')
-    .upsert({
-      id: data.user.id,
-      name,
-      phone: phone ?? null,
-      role: 'admin',
-      employee_status: null,
-    })
-    .select('id, name, phone, role, created_at, updated_at')
-    .single()
-
-  if (profileErr) return res.status(400).json({ error: profileErr.message })
+  const id = randomUUID()
+  const passwordHash = await hashPassword(password)
+  const profile = await queryOne(
+    `INSERT INTO dbo.profiles (id, name, phone, role, employee_status, email, password_hash, active, created_at, updated_at)
+     OUTPUT inserted.id, inserted.name, inserted.phone, inserted.role, inserted.email, inserted.active, inserted.created_at, inserted.updated_at
+     VALUES (@id, @name, @phone, 'admin', NULL, @email, @hash, 1, SYSDATETIMEOFFSET(), SYSDATETIMEOFFSET())`,
+    { id: uuidParam(id), name, phone: phone ?? null, email, hash: passwordHash }
+  )
 
   res.status(201).json({
-    admin: enrichAdmin(profile, data.user ?? undefined),
+    admin: profile,
     credentials: { email, password },
     message: 'Admin created. Share these credentials securely with the store admin.',
   })
@@ -92,66 +56,44 @@ export async function updateAdmin(req: AuthRequest, res: Response) {
   const { id } = req.params
   const { name, phone, email } = req.body
 
-  const { data: existing } = await supabase
-    .from('profiles')
-    .select('id, role')
-    .eq('id', id)
-    .eq('role', 'admin')
-    .single()
-
+  const existing = await queryOne<{ id: string }>(
+    "SELECT id FROM dbo.profiles WHERE id = @id AND role = 'admin'",
+    { id: uuidParam(id) }
+  )
   if (!existing) return res.status(404).json({ error: 'Admin not found' })
 
-  if (email) {
-    const { error: emailErr } = await supabase.auth.admin.updateUserById(id, { email })
-    if (emailErr) return res.status(400).json({ error: emailErr.message })
-  }
+  const sets: string[] = ['updated_at = SYSDATETIMEOFFSET()']
+  const params: Record<string, unknown> = { id: uuidParam(id) }
+  if (name !== undefined) { sets.push('name = @name'); params.name = name }
+  if (phone !== undefined) { sets.push('phone = @phone'); params.phone = phone }
+  if (email !== undefined) { sets.push('email = @email'); params.email = email }
 
-  const updates: Record<string, unknown> = { updated_at: new Date().toISOString() }
-  if (name !== undefined) updates.name = name
-  if (phone !== undefined) updates.phone = phone
-
-  if (name !== undefined || phone !== undefined) {
-    const { data: profile, error } = await supabase
-      .from('profiles')
-      .update(updates)
-      .eq('id', id)
-      .select('id, name, phone, role, created_at, updated_at')
-      .single()
-
-    if (error) return res.status(400).json({ error: error.message })
-
-    const { data: authUser } = await supabase.auth.admin.getUserById(id)
-    return res.json(enrichAdmin(profile, authUser?.user ?? undefined))
-  }
-
-  const { data: profile } = await supabase
-    .from('profiles')
-    .select('id, name, phone, role, created_at, updated_at')
-    .eq('id', id)
-    .single()
-
-  const { data: authUser } = await supabase.auth.admin.getUserById(id)
-  res.json(enrichAdmin(profile!, authUser?.user ?? undefined))
+  const profile = await queryOne(
+    `UPDATE dbo.profiles SET ${sets.join(', ')}
+     OUTPUT inserted.id, inserted.name, inserted.phone, inserted.role, inserted.email, inserted.active, inserted.created_at, inserted.updated_at
+     WHERE id = @id`,
+    params
+  )
+  res.json(profile)
 }
 
 export async function resetAdminPassword(req: AuthRequest, res: Response) {
   const { id } = req.params
   const { password } = req.body
 
-  const { data: profile } = await supabase
-    .from('profiles')
-    .select('role')
-    .eq('id', id)
-    .eq('role', 'admin')
-    .single()
-
+  const profile = await queryOne<{ id: string }>(
+    "SELECT id FROM dbo.profiles WHERE id = @id AND role = 'admin'",
+    { id: uuidParam(id) }
+  )
   if (!profile) return res.status(404).json({ error: 'Admin not found' })
   if (!password || String(password).length < 6) {
     return res.status(400).json({ error: 'password must be at least 6 characters' })
   }
 
-  const { error } = await supabase.auth.admin.updateUserById(id, { password })
-  if (error) return res.status(400).json({ error: error.message })
+  await query('UPDATE dbo.profiles SET password_hash = @h, updated_at = SYSDATETIMEOFFSET() WHERE id = @id', {
+    h: await hashPassword(password),
+    id: uuidParam(id),
+  })
   res.json({ success: true, message: 'Admin password updated' })
 }
 
@@ -166,19 +108,16 @@ export async function setAdminActive(req: AuthRequest, res: Response) {
     return res.status(400).json({ error: 'You cannot deactivate your own account' })
   }
 
-  const { data: profile } = await supabase
-    .from('profiles')
-    .select('role')
-    .eq('id', id)
-    .eq('role', 'admin')
-    .single()
-
+  const profile = await queryOne<{ id: string }>(
+    "SELECT id FROM dbo.profiles WHERE id = @id AND role = 'admin'",
+    { id: uuidParam(id) }
+  )
   if (!profile) return res.status(404).json({ error: 'Admin not found' })
 
-  const { error } = await supabase.auth.admin.updateUserById(id, {
-    ban_duration: active ? 'none' : '876000h',
+  await query('UPDATE dbo.profiles SET active = @a, updated_at = SYSDATETIMEOFFSET() WHERE id = @id', {
+    a: active ? 1 : 0,
+    id: uuidParam(id),
   })
-  if (error) return res.status(400).json({ error: error.message })
   res.json({ success: true, active })
 }
 
@@ -189,21 +128,20 @@ export async function deleteAdmin(req: AuthRequest, res: Response) {
     return res.status(400).json({ error: 'You cannot delete your own account' })
   }
 
-  const { data: profile } = await supabase
-    .from('profiles')
-    .select('role')
-    .eq('id', id)
-    .eq('role', 'admin')
-    .single()
-
+  const profile = await queryOne<{ id: string }>(
+    "SELECT id FROM dbo.profiles WHERE id = @id AND role = 'admin'",
+    { id: uuidParam(id) }
+  )
   if (!profile) return res.status(404).json({ error: 'Admin not found' })
 
-  const { error } = await supabase.auth.admin.deleteUser(id)
-  if (error) {
+  try {
+    await query('DELETE FROM dbo.profiles WHERE id = @id', { id: uuidParam(id) })
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : ''
     return res.status(400).json({
-      error: /foreign key|violates/i.test(error.message)
+      error: /REFERENCE|FOREIGN KEY|conflicted/i.test(msg)
         ? 'This admin has linked records and cannot be deleted.'
-        : error.message,
+        : msg,
     })
   }
   res.json({ success: true })

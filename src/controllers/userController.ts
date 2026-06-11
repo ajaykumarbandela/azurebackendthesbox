@@ -1,15 +1,14 @@
 import { Response } from 'express'
-import { supabase } from '../supabase'
+import { randomUUID } from 'crypto'
+import { query, queryOne, uuidParam } from '../db'
+import { hashPassword } from '../auth/password'
 import { AuthRequest } from '../middleware/auth'
 
 const VALID_ROLES = ['customer', 'employee', 'admin']
 
-// A user is deactivated when Supabase has them banned into the future.
-const isBanned = (u?: { banned_until?: string | null } | null) =>
-  !!u?.banned_until && new Date(u.banned_until).getTime() > Date.now()
-
-// List users by role (admin only). Merges auth emails and, for customers,
-// per-user order stats so the Customers screen can show spend at a glance.
+// List users by role (admin only). Includes per-user order stats (customers)
+// so the Customers screen can show spend at a glance. Email/active are columns
+// now, joined in directly rather than merged from Supabase auth.
 export async function listUsers(req: AuthRequest, res: Response) {
   const { role = 'customer', search, page = '1', limit = '20' } = req.query
 
@@ -17,71 +16,43 @@ export async function listUsers(req: AuthRequest, res: Response) {
     return res.status(403).json({ error: 'Forbidden' })
   }
 
-  const from = (+page - 1) * +limit
-  const to = +page * +limit - 1
+  const offset = (+page - 1) * +limit
+  const params: Record<string, unknown> = { role, limit: +limit, offset }
+  let where = 'WHERE p.role = @role'
+  if (search) { where += ' AND p.name LIKE @search'; params.search = `%${search}%` }
 
-  let query = supabase
-    .from('profiles')
-    .select('id, name, phone, role, employee_status, created_at', { count: 'exact' })
-    .eq('role', role as string)
-    .order('created_at', { ascending: false })
+  // order stats aggregated per user in a correlated subquery
+  const rows = await query(
+    `SELECT p.id, p.name, p.phone, p.role, p.employee_status, p.email, p.active, p.created_at,
+            ISNULL(s.orderCount, 0) AS orderCount, ISNULL(s.totalSpent, 0) AS totalSpent
+     FROM dbo.profiles p
+     OUTER APPLY (
+       SELECT COUNT(*) AS orderCount, SUM(o.total_amount) AS totalSpent
+       FROM dbo.orders o WHERE o.user_id = p.id AND o.status <> 'cancelled'
+     ) s
+     ${where}
+     ORDER BY p.created_at DESC
+     OFFSET @offset ROWS FETCH NEXT @limit ROWS ONLY`,
+    params
+  )
+  const countRow = await queryOne<{ total: number }>(
+    `SELECT COUNT(*) AS total FROM dbo.profiles p ${where}`,
+    params
+  )
 
-  if (search) query = query.ilike('name', `%${search}%`)
-
-  const { data: profiles, error, count } = await query.range(from, to)
-  if (error) return res.status(500).json({ error: error.message })
-
-  const { data: authList } = await supabase.auth.admin.listUsers({ page: 1, perPage: 1000 })
-  const authMap = new Map((authList?.users ?? []).map((u) => [u.id, u]))
-
-  const ids = (profiles ?? []).map((p) => p.id)
-  const statsMap: Record<string, { orderCount: number; totalSpent: number }> = {}
-  if (ids.length) {
-    const { data: orders } = await supabase
-      .from('orders')
-      .select('user_id, total_amount, status')
-      .in('user_id', ids)
-      .not('status', 'eq', 'cancelled')
-    for (const o of orders ?? []) {
-      const k = o.user_id as string
-      if (!statsMap[k]) statsMap[k] = { orderCount: 0, totalSpent: 0 }
-      statsMap[k].orderCount += 1
-      statsMap[k].totalSpent += Number(o.total_amount)
-    }
-  }
-
-  const data = (profiles ?? []).map((p) => {
-    const au = authMap.get(p.id)
-    return {
-      ...p,
-      email: au?.email ?? null,
-      active: !isBanned(au),
-      orderCount: statsMap[p.id]?.orderCount ?? 0,
-      totalSpent: statsMap[p.id]?.totalSpent ?? 0,
-    }
-  })
-
-  res.json({ data, count, page: +page, limit: +limit })
+  res.json({ data: rows, count: countRow?.total ?? 0, page: +page, limit: +limit })
 }
 
 export async function getUser(req: AuthRequest, res: Response) {
-  const { data: profile, error } = await supabase
-    .from('profiles')
-    .select('*')
-    .eq('id', req.params.id)
-    .single()
-
-  if (error) return res.status(404).json({ error: 'User not found' })
+  const profile = await queryOne<{ role: string }>(
+    'SELECT * FROM dbo.profiles WHERE id = @id',
+    { id: uuidParam(req.params.id) }
+  )
+  if (!profile) return res.status(404).json({ error: 'User not found' })
   if (profile.role === 'superadmin' || profile.role === 'admin') {
     return res.status(404).json({ error: 'User not found' })
   }
-
-  const { data: authUser } = await supabase.auth.admin.getUserById(req.params.id)
-  res.json({
-    ...profile,
-    email: authUser?.user?.email ?? null,
-    active: !isBanned(authUser?.user),
-  })
+  res.json(profile)
 }
 
 // Create a user with any role (admin only). Admin-created employees are
@@ -102,46 +73,42 @@ export async function createUser(req: AuthRequest, res: Response) {
     return res.status(403).json({ error: 'Only super admins can create admin accounts' })
   }
 
-  const { data, error } = await supabase.auth.admin.createUser({
-    email,
-    password,
-    email_confirm: true,
-    user_metadata: { name, phone: phone ?? null, role },
-  })
+  const existing = await queryOne<{ id: string }>('SELECT id FROM dbo.profiles WHERE email = @email', { email })
+  if (existing) return res.status(400).json({ error: 'A user with this email already exists' })
 
-  if (error) return res.status(400).json({ error: error.message })
-
+  const id = randomUUID()
   const employee_status = role === 'employee' ? 'approved' : null
-  const { data: profile, error: profileErr } = await supabase
-    .from('profiles')
-    .upsert({ id: data.user.id, name, phone: phone ?? null, role, employee_status })
-    .select()
-    .single()
+  const profile = await queryOne(
+    `INSERT INTO dbo.profiles (id, name, phone, role, employee_status, email, password_hash, active, created_at, updated_at)
+     OUTPUT inserted.*
+     VALUES (@id, @name, @phone, @role, @es, @email, @hash, 1, SYSDATETIMEOFFSET(), SYSDATETIMEOFFSET())`,
+    { id: uuidParam(id), name, phone: phone ?? null, role, es: employee_status, email, hash: await hashPassword(password) }
+  )
 
-  if (profileErr) return res.status(400).json({ error: profileErr.message })
-
-  res.status(201).json({ ...profile, email: data.user.email })
+  res.status(201).json(profile)
 }
 
 // Permanently delete a user account (admin only). Fails gracefully if the user
-// still has linked records (e.g. a customer with orders) — the FK blocks it.
+// still has linked records (FK blocks it).
 export async function deleteUser(req: AuthRequest, res: Response) {
   const { id } = req.params
   if (id === req.user!.id) {
     return res.status(400).json({ error: 'You cannot delete your own account' })
   }
 
-  const { data: profile } = await supabase.from('profiles').select('role').eq('id', id).single()
+  const profile = await queryOne<{ role: string }>('SELECT role FROM dbo.profiles WHERE id = @id', { id: uuidParam(id) })
   if (profile?.role === 'superadmin') {
     return res.status(404).json({ error: 'User not found' })
   }
 
-  const { error } = await supabase.auth.admin.deleteUser(id)
-  if (error) {
+  try {
+    await query('DELETE FROM dbo.profiles WHERE id = @id', { id: uuidParam(id) })
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : ''
     return res.status(400).json({
-      error: /foreign key|violates/i.test(error.message)
+      error: /REFERENCE|FOREIGN KEY|conflicted/i.test(msg)
         ? 'This account has orders or sales linked to it and cannot be deleted.'
-        : error.message,
+        : msg,
     })
   }
   res.json({ success: true })
@@ -152,25 +119,26 @@ export async function resetUserPassword(req: AuthRequest, res: Response) {
   const { id } = req.params
   const { password } = req.body
 
-  const { data: profile } = await supabase.from('profiles').select('role').eq('id', id).single()
+  const profile = await queryOne<{ role: string }>('SELECT role FROM dbo.profiles WHERE id = @id', { id: uuidParam(id) })
   if (profile?.role === 'superadmin') {
     return res.status(404).json({ error: 'User not found' })
   }
   if (profile?.role === 'admin') {
     return res.status(403).json({ error: 'Only super admins can reset admin passwords' })
   }
-
   if (!password || String(password).length < 6) {
     return res.status(400).json({ error: 'password must be at least 6 characters' })
   }
 
-  const { error } = await supabase.auth.admin.updateUserById(id, { password })
-  if (error) return res.status(400).json({ error: error.message })
+  await query('UPDATE dbo.profiles SET password_hash = @h, updated_at = SYSDATETIMEOFFSET() WHERE id = @id', {
+    h: await hashPassword(password),
+    id: uuidParam(id),
+  })
   res.json({ success: true })
 }
 
-// Activate / deactivate a user. Deactivating bans them in Supabase, which
-// blocks login while keeping all their records intact (reversible).
+// Activate / deactivate a user. Sets the active flag (reversible), keeping all
+// their records intact. Inactive users are blocked at login.
 export async function setUserActive(req: AuthRequest, res: Response) {
   const { id } = req.params
   const { active } = req.body
@@ -182,14 +150,14 @@ export async function setUserActive(req: AuthRequest, res: Response) {
     return res.status(400).json({ error: 'You cannot deactivate your own account' })
   }
 
-  const { data: profile } = await supabase.from('profiles').select('role').eq('id', id).single()
+  const profile = await queryOne<{ role: string }>('SELECT role FROM dbo.profiles WHERE id = @id', { id: uuidParam(id) })
   if (profile?.role === 'superadmin') {
     return res.status(404).json({ error: 'User not found' })
   }
 
-  const { error } = await supabase.auth.admin.updateUserById(id, {
-    ban_duration: active ? 'none' : '876000h',
+  await query('UPDATE dbo.profiles SET active = @a, updated_at = SYSDATETIMEOFFSET() WHERE id = @id', {
+    a: active ? 1 : 0,
+    id: uuidParam(id),
   })
-  if (error) return res.status(400).json({ error: error.message })
   res.json({ success: true, active })
 }

@@ -1,5 +1,6 @@
 import { Response } from 'express'
-import { supabase } from '../supabase'
+import { randomUUID } from 'crypto'
+import { query, queryOne, getPool, uuidParam, sql } from '../db'
 import { AuthRequest } from '../middleware/auth'
 
 // Record an in-person ("offline") sale attributed to the current employee/admin.
@@ -13,40 +14,37 @@ export async function recordOfflineSale(req: AuthRequest, res: Response) {
     return res.status(400).json({ error: 'variant_id and a positive quantity are required' })
   }
 
-  const { data: variant, error: vErr } = await supabase
-    .from('variants')
-    .select('id, quantity, product_id, product:products(base_price, discount_pct)')
-    .eq('id', variant_id)
-    .single()
-
-  if (vErr || !variant) return res.status(404).json({ error: 'Variant not found' })
+  const variant = await queryOne<{ id: string; quantity: number; product_id: string; base_price: number | null; discount_pct: number | null }>(
+    `SELECT v.id, v.quantity, v.product_id, p.base_price, p.discount_pct
+     FROM dbo.variants v LEFT JOIN dbo.products p ON p.id = v.product_id
+     WHERE v.id = @id`,
+    { id: uuidParam(variant_id) }
+  )
+  if (!variant) return res.status(404).json({ error: 'Variant not found' })
   if (variant.quantity < qty) {
     return res.status(400).json({ error: `Only ${variant.quantity} in stock` })
   }
 
-  const product = variant.product as unknown as { base_price: number; discount_pct: number } | null
-  const base = Number(product?.base_price ?? 0)
-  const disc = Number(product?.discount_pct ?? 0)
+  const base = Number(variant.base_price ?? 0)
+  const disc = Number(variant.discount_pct ?? 0)
   const unit_price = Math.round(base * (1 - disc / 100))
 
-  const { data: sale, error: sErr } = await supabase
-    .from('offline_sales')
-    .insert({
-      variant_id,
-      product_id: variant.product_id,
-      sold_by: req.user!.id,
-      quantity: qty,
-      unit_price,
-      customer_name,
-      customer_phone,
-    })
-    .select()
-    .single()
-
-  if (sErr) return res.status(400).json({ error: sErr.message })
+  const sale = await queryOne(
+    `INSERT INTO dbo.offline_sales (id, variant_id, product_id, sold_by, quantity, unit_price, customer_name, customer_phone, created_at)
+     OUTPUT inserted.*
+     VALUES (@id, @vid, @pid, @soldby, @qty, @price, @cname, @cphone, SYSDATETIMEOFFSET())`,
+    {
+      id: uuidParam(randomUUID()), vid: uuidParam(variant_id), pid: uuidParam(variant.product_id),
+      soldby: uuidParam(req.user!.id), qty, price: unit_price, cname: customer_name, cphone: customer_phone,
+    }
+  )
 
   // Atomically decrement stock and bump sold_count.
-  await supabase.rpc('decrement_variant_stock', { variant_id, qty })
+  const pool = await getPool()
+  await pool.request()
+    .input('variant_id', sql.UniqueIdentifier, variant_id)
+    .input('qty', sql.Int, qty)
+    .execute('dbo.decrement_variant_stock')
 
   res.status(201).json(sale)
 }
@@ -54,28 +52,35 @@ export async function recordOfflineSale(req: AuthRequest, res: Response) {
 // List offline sales. Employees see only their own; admins see all.
 export async function getOfflineSales(req: AuthRequest, res: Response) {
   const { page = '1', limit = '20', soldBy } = req.query
-  const soldByValue =
-    typeof soldBy === 'string' ? soldBy : Array.isArray(soldBy) ? soldBy[0] : undefined
+  const soldByValue: string | undefined =
+    typeof soldBy === 'string' ? soldBy
+    : Array.isArray(soldBy) && typeof soldBy[0] === 'string' ? soldBy[0]
+    : undefined
 
-  let query = supabase
-    .from('offline_sales')
-    .select(
-      `*,
-       product:products(id, title),
-       variant:variants(id, color, size, sku),
-       seller:profiles!sold_by(id, name)`,
-      { count: 'exact' }
-    )
-    .order('created_at', { ascending: false })
-    .range((+page - 1) * +limit, +page * +limit - 1)
+  const where: string[] = []
+  const params: Record<string, unknown> = { offset: (+page - 1) * +limit, limit: +limit }
+  if (req.user!.role === 'employee') { where.push('os.sold_by = @sold'); params.sold = uuidParam(req.user!.id) }
+  else if (soldByValue) { where.push('os.sold_by = @sold'); params.sold = uuidParam(soldByValue) }
+  const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : ''
 
-  if (req.user!.role === 'employee') {
-    query = query.eq('sold_by', req.user!.id)
-  } else if (soldByValue) {
-    query = query.eq('sold_by', soldByValue)
-  }
+  const cols = `
+    os.*,
+    JSON_QUERY((SELECT p.id, p.title FROM dbo.products p WHERE p.id = os.product_id FOR JSON PATH, INCLUDE_NULL_VALUES, WITHOUT_ARRAY_WRAPPER)) AS product,
+    JSON_QUERY((SELECT v.id, v.color, v.size, v.sku FROM dbo.variants v WHERE v.id = os.variant_id FOR JSON PATH, INCLUDE_NULL_VALUES, WITHOUT_ARRAY_WRAPPER)) AS variant,
+    JSON_QUERY((SELECT pr.id, pr.name FROM dbo.profiles pr WHERE pr.id = os.sold_by FOR JSON PATH, INCLUDE_NULL_VALUES, WITHOUT_ARRAY_WRAPPER)) AS seller`
 
-  const { data, error, count } = await query
-  if (error) return res.status(500).json({ error: error.message })
-  res.json({ data, count, page: +page, limit: +limit })
+  const rows = await query(
+    `SELECT ${cols} FROM dbo.offline_sales os ${whereSql}
+     ORDER BY os.created_at DESC OFFSET @offset ROWS FETCH NEXT @limit ROWS ONLY`,
+    params
+  )
+  const countRow = await queryOne<{ total: number }>(`SELECT COUNT(*) AS total FROM dbo.offline_sales os ${whereSql}`, params)
+
+  const data = rows.map((r) => ({
+    ...r,
+    product: r.product ? JSON.parse(r.product as string) : null,
+    variant: r.variant ? JSON.parse(r.variant as string) : null,
+    seller: r.seller ? JSON.parse(r.seller as string) : null,
+  }))
+  res.json({ data, count: countRow?.total ?? 0, page: +page, limit: +limit })
 }

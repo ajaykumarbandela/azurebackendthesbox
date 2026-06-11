@@ -1,6 +1,7 @@
 import { Router, Request, Response } from 'express'
 import { body, validationResult } from 'express-validator'
-import { supabase } from '../supabase'
+import { randomUUID } from 'crypto'
+import { query, queryOne, uuidParam } from '../db'
 import { authenticate, requireApprovedEmployee } from '../middleware/auth'
 import { uploadImage } from '../services/storageService'
 import multer from 'multer'
@@ -9,36 +10,23 @@ const router = Router()
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } })
 
 function slugify(value: string): string {
-  return value
-    .toLowerCase()
-    .trim()
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/^-+|-+$/g, '')
+  return value.toLowerCase().trim().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '')
 }
 
-// List categories. ?topLevel=true returns only roots; ?parentId=<id> returns one parent's children.
+// List categories. ?topLevel=true → roots only; ?parentId=<id> → that parent's children.
 router.get('/', async (req: Request, res: Response) => {
-  let query = supabase.from('categories').select('*').order('name')
+  let where = ''
+  const params: Record<string, unknown> = {}
+  if (req.query.parentId) { where = 'WHERE parent_id = @pid'; params.pid = uuidParam(req.query.parentId as string) }
+  else if (req.query.topLevel === 'true') { where = 'WHERE parent_id IS NULL' }
 
-  if (req.query.parentId) {
-    query = query.eq('parent_id', req.query.parentId as string)
-  } else if (req.query.topLevel === 'true') {
-    query = query.is('parent_id', null)
-  }
-
-  const { data, error } = await query
-  if (error) return res.status(500).json({ error: error.message })
+  const data = await query(`SELECT * FROM dbo.categories ${where} ORDER BY name`, params)
   res.json(data)
 })
 
 router.get('/:slug', async (req: Request, res: Response) => {
-  const { data, error } = await supabase
-    .from('categories')
-    .select('*')
-    .eq('slug', req.params.slug)
-    .single()
-
-  if (error) return res.status(404).json({ error: 'Category not found' })
+  const data = await queryOne('SELECT * FROM dbo.categories WHERE slug = @slug', { slug: req.params.slug })
+  if (!data) return res.status(404).json({ error: 'Category not found' })
   res.json(data)
 })
 
@@ -55,24 +43,24 @@ router.post(
     const { name, description, parent_id } = req.body
     const slug = req.body.slug?.trim() || slugify(name)
 
-    let image_url: string | undefined = req.body.image_url || undefined
+    let image_url: string | null = req.body.image_url || null
     try {
-      if (req.file) {
-        image_url = await uploadImage(req.file.buffer, req.file.originalname, 'category-images')
-      }
+      if (req.file) image_url = await uploadImage(req.file.buffer, req.file.originalname, 'category-images')
     } catch (err) {
-      const message = err instanceof Error ? err.message : 'Image upload failed'
-      return res.status(500).json({ error: message })
+      return res.status(500).json({ error: err instanceof Error ? err.message : 'Image upload failed' })
     }
 
-    const { data, error } = await supabase
-      .from('categories')
-      .insert({ name, slug, description, image_url, parent_id: parent_id || null })
-      .select()
-      .single()
-
-    if (error) return res.status(400).json({ error: error.message })
-    res.status(201).json(data)
+    try {
+      const data = await queryOne(
+        `INSERT INTO dbo.categories (id, name, slug, description, image_url, parent_id, created_at)
+         OUTPUT inserted.*
+         VALUES (@id, @name, @slug, @description, @image_url, @parent_id, SYSDATETIMEOFFSET())`,
+        { id: uuidParam(randomUUID()), name, slug, description: description ?? null, image_url, parent_id: uuidParam(parent_id || null) }
+      )
+      res.status(201).json(data)
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : 'Create failed' })
+    }
   }
 )
 
@@ -83,53 +71,43 @@ router.patch(
   upload.single('image'),
   async (req: Request, res: Response) => {
     const { name, slug, description, parent_id } = req.body
-    const updates: Record<string, unknown> = {}
-    if (name) updates.name = name
-    if (slug) updates.slug = slug
-    if (description !== undefined) updates.description = description
+    const sets: string[] = []
+    const params: Record<string, unknown> = { id: uuidParam(req.params.id) }
+    if (name) { sets.push('name = @name'); params.name = name }
+    if (slug) { sets.push('slug = @slug'); params.slug = slug }
+    if (description !== undefined) { sets.push('description = @description'); params.description = description }
 
     if (parent_id !== undefined) {
-      if (parent_id === req.params.id) {
-        return res.status(400).json({ error: 'A category cannot be its own parent' })
-      }
-      updates.parent_id = parent_id || null
+      if (parent_id === req.params.id) return res.status(400).json({ error: 'A category cannot be its own parent' })
+      sets.push('parent_id = @parent_id'); params.parent_id = uuidParam(parent_id || null)
     }
 
     try {
-      if (req.file) {
-        updates.image_url = await uploadImage(req.file.buffer, req.file.originalname, 'category-images')
-      } else if (req.body.image_url !== undefined) {
-        updates.image_url = req.body.image_url || null
-      }
+      if (req.file) { sets.push('image_url = @image_url'); params.image_url = await uploadImage(req.file.buffer, req.file.originalname, 'category-images') }
+      else if (req.body.image_url !== undefined) { sets.push('image_url = @image_url'); params.image_url = req.body.image_url || null }
     } catch (err) {
-      const message = err instanceof Error ? err.message : 'Image upload failed'
-      return res.status(500).json({ error: message })
+      return res.status(500).json({ error: err instanceof Error ? err.message : 'Image upload failed' })
     }
 
-    if (Object.keys(updates).length === 0) {
-      return res.status(400).json({ error: 'No updates provided' })
+    if (sets.length === 0) return res.status(400).json({ error: 'No updates provided' })
+
+    try {
+      const data = await queryOne(`UPDATE dbo.categories SET ${sets.join(', ')} OUTPUT inserted.* WHERE id = @id`, params)
+      if (!data) return res.status(404).json({ error: 'Category not found' })
+      res.json(data)
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : 'Update failed' })
     }
-
-    const { data, error } = await supabase
-      .from('categories')
-      .update(updates)
-      .eq('id', req.params.id)
-      .select()
-      .single()
-
-    if (error) return res.status(400).json({ error: error.message })
-    res.json(data)
   }
 )
 
 router.delete('/:id', authenticate, requireApprovedEmployee, async (req: Request, res: Response) => {
-  const { error } = await supabase
-    .from('categories')
-    .delete()
-    .eq('id', req.params.id)
-
-  if (error) return res.status(400).json({ error: error.message })
-  res.json({ success: true })
+  try {
+    await query('DELETE FROM dbo.categories WHERE id = @id', { id: uuidParam(req.params.id) })
+    res.json({ success: true })
+  } catch (err) {
+    res.status(400).json({ error: err instanceof Error ? err.message : 'Delete failed' })
+  }
 })
 
 export default router

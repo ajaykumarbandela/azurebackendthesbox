@@ -1,11 +1,10 @@
-import { supabase } from '../supabase'
+import { query, queryOne, getPool, uuidParam, sql } from '../db'
 
 export type AiUsageType = 'image' | 'content'
 export type ResetPeriod = 'lifetime' | 'monthly'
 
 export class QuotaExceededError extends Error {
   readonly usageType: AiUsageType
-
   constructor(usageType: AiUsageType) {
     const label = usageType === 'image' ? 'image' : 'content'
     super(`AI ${label} quota exhausted. Contact platform admin.`)
@@ -24,12 +23,7 @@ interface QuotaRow {
   updated_at: string | null
 }
 
-export interface QuotaBucket {
-  used: number
-  limit: number
-  remaining: number
-}
-
+export interface QuotaBucket { used: number; limit: number; remaining: number }
 export interface QuotaStats {
   images: QuotaBucket
   content: QuotaBucket
@@ -39,34 +33,24 @@ export interface QuotaStats {
 }
 
 async function ensurePeriodFresh(): Promise<void> {
-  const { error } = await supabase.rpc('maybe_reset_ai_quota_period')
-  if (error) throw new Error(error.message)
+  const pool = await getPool()
+  await pool.request().execute('dbo.maybe_reset_ai_quota_period')
 }
 
 async function fetchSettingsRow(): Promise<QuotaRow> {
   await ensurePeriodFresh()
-  const { data, error } = await supabase
-    .from('ai_quota_settings')
-    .select('image_limit, content_limit, reset_period, period_start, images_used, content_used, updated_at')
-    .eq('id', 1)
-    .single()
-
-  if (error || !data) throw new Error('AI quota settings not configured')
-  return data as QuotaRow
+  const data = await queryOne<QuotaRow>(
+    `SELECT image_limit, content_limit, reset_period, period_start, images_used, content_used, updated_at
+     FROM dbo.ai_quota_settings WHERE id = 1`
+  )
+  if (!data) throw new Error('AI quota settings not configured')
+  return data
 }
 
 function toStats(row: QuotaRow): QuotaStats {
   return {
-    images: {
-      used: row.images_used,
-      limit: row.image_limit,
-      remaining: Math.max(0, row.image_limit - row.images_used),
-    },
-    content: {
-      used: row.content_used,
-      limit: row.content_limit,
-      remaining: Math.max(0, row.content_limit - row.content_used),
-    },
+    images: { used: row.images_used, limit: row.image_limit, remaining: Math.max(0, row.image_limit - row.images_used) },
+    content: { used: row.content_used, limit: row.content_limit, remaining: Math.max(0, row.content_limit - row.content_used) },
     resetPeriod: row.reset_period,
     periodStart: row.period_start,
     updatedAt: row.updated_at,
@@ -74,21 +58,20 @@ function toStats(row: QuotaRow): QuotaStats {
 }
 
 export async function getQuotaStats(): Promise<QuotaStats> {
-  const row = await fetchSettingsRow()
-  return toStats(row)
+  return toStats(await fetchSettingsRow())
 }
 
 export async function consumeQuota(type: AiUsageType, userId?: string): Promise<void> {
-  const { error } = await supabase.rpc('consume_ai_quota', {
-    p_type: type,
-    p_user_id: userId ?? null,
-  })
-
-  if (error) {
-    const msg = error.message.toLowerCase()
+  const pool = await getPool()
+  try {
+    const req = pool.request().input('p_type', type)
+    if (userId) req.input('p_user_id', sql.UniqueIdentifier, userId)
+    await req.execute('dbo.consume_ai_quota')
+  } catch (err) {
+    const msg = (err instanceof Error ? err.message : '').toLowerCase()
     if (msg.includes('image quota exhausted')) throw new QuotaExceededError('image')
     if (msg.includes('content quota exhausted')) throw new QuotaExceededError('content')
-    throw new Error(error.message)
+    throw err instanceof Error ? err : new Error('Quota consumption failed')
   }
 }
 
@@ -98,51 +81,35 @@ export interface UpdateLimitsInput {
   resetPeriod?: ResetPeriod
 }
 
-export async function updateLimits(
-  input: UpdateLimitsInput,
-  updatedBy: string
-): Promise<QuotaStats> {
-  const { data: profile } = await supabase
-    .from('profiles')
-    .select('id')
-    .eq('id', updatedBy)
-    .maybeSingle()
+export async function updateLimits(input: UpdateLimitsInput, updatedBy: string): Promise<QuotaStats> {
+  const profile = await queryOne<{ id: string }>('SELECT id FROM dbo.profiles WHERE id = @id', { id: uuidParam(updatedBy) })
 
-  const patch: Record<string, unknown> = {
-    updated_at: new Date().toISOString(),
-    updated_by: profile?.id ?? null,
-  }
+  const sets: string[] = ['updated_at = SYSDATETIMEOFFSET()', 'updated_by = @updated_by']
+  const params: Record<string, unknown> = { updated_by: uuidParam(profile?.id ?? null) }
 
   if (input.imageLimit !== undefined) {
-    if (!Number.isInteger(input.imageLimit) || input.imageLimit < 0) {
-      throw new Error('imageLimit must be a non-negative integer')
-    }
-    patch.image_limit = input.imageLimit
+    if (!Number.isInteger(input.imageLimit) || input.imageLimit < 0) throw new Error('imageLimit must be a non-negative integer')
+    sets.push('image_limit = @image_limit'); params.image_limit = input.imageLimit
   }
   if (input.contentLimit !== undefined) {
-    if (!Number.isInteger(input.contentLimit) || input.contentLimit < 0) {
-      throw new Error('contentLimit must be a non-negative integer')
-    }
-    patch.content_limit = input.contentLimit
+    if (!Number.isInteger(input.contentLimit) || input.contentLimit < 0) throw new Error('contentLimit must be a non-negative integer')
+    sets.push('content_limit = @content_limit'); params.content_limit = input.contentLimit
   }
   if (input.resetPeriod !== undefined) {
-    if (!['lifetime', 'monthly'].includes(input.resetPeriod)) {
-      throw new Error('resetPeriod must be lifetime or monthly')
-    }
-    patch.reset_period = input.resetPeriod
+    if (!['lifetime', 'monthly'].includes(input.resetPeriod)) throw new Error('resetPeriod must be lifetime or monthly')
+    sets.push('reset_period = @reset_period'); params.reset_period = input.resetPeriod
     if (input.resetPeriod === 'monthly') {
-      patch.period_start = new Date(new Date().getFullYear(), new Date().getMonth(), 1).toISOString()
+      sets.push('period_start = @period_start')
+      params.period_start = new Date(new Date().getFullYear(), new Date().getMonth(), 1).toISOString()
     }
   }
 
-  const { error } = await supabase.from('ai_quota_settings').update(patch).eq('id', 1)
-  if (error) throw new Error(error.message)
-
+  await query(`UPDATE dbo.ai_quota_settings SET ${sets.join(', ')} WHERE id = 1`, params)
   return getQuotaStats()
 }
 
 export async function resetPeriodCounters(): Promise<QuotaStats> {
-  const { error } = await supabase.rpc('reset_ai_quota_period')
-  if (error) throw new Error(error.message)
+  const pool = await getPool()
+  await pool.request().execute('dbo.reset_ai_quota_period')
   return getQuotaStats()
 }

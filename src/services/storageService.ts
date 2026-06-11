@@ -1,6 +1,25 @@
 import { randomUUID } from 'crypto'
 import sharp from 'sharp'
-import { supabase } from '../supabase'
+import { BlobServiceClient } from '@azure/storage-blob'
+
+// Image storage on Azure Blob. Configure with AZURE_STORAGE_CONNECTION_STRING.
+// Until that is set, uploads fail with a clear, actionable error (the rest of
+// the app builds and runs; only image upload is gated).
+//
+// Container names mirror the old Supabase bucket ids so existing image URLs and
+// calling code stay unchanged.
+const CONN = process.env.AZURE_STORAGE_CONNECTION_STRING
+
+let blobService: BlobServiceClient | null = null
+function getService(): BlobServiceClient {
+  if (!CONN) {
+    throw new Error(
+      'Image storage is not configured. Set AZURE_STORAGE_CONNECTION_STRING in the backend .env to enable uploads.'
+    )
+  }
+  if (!blobService) blobService = BlobServiceClient.fromConnectionString(CONN)
+  return blobService
+}
 
 export async function uploadImage(
   buffer: Buffer,
@@ -11,32 +30,21 @@ export async function uploadImage(
   const filename = `${Date.now()}-${stem}-${randomUUID()}.webp`
 
   const pipeline = sharp(buffer)
-
-  // Product catalog: center-crop to 3:4 portrait (Myntra-style consistency)
   const optimized =
     bucket === 'product-images'
-      ? await pipeline
-          .resize(1200, 1600, { fit: 'cover', position: 'centre' })
-          .webp({ quality: 85 })
-          .toBuffer()
-      : await pipeline
-          .resize({ width: 1200, withoutEnlargement: true })
-          .webp({ quality: 85 })
-          .toBuffer()
+      ? await pipeline.resize(1200, 1600, { fit: 'cover', position: 'centre' }).webp({ quality: 85 }).toBuffer()
+      : await pipeline.resize({ width: 1200, withoutEnlargement: true }).webp({ quality: 85 }).toBuffer()
 
-  const { error } = await supabase.storage
-    .from(bucket)
-    .upload(filename, optimized, { contentType: 'image/webp', upsert: false })
+  const container = getService().getContainerClient(bucket)
+  // Public read access so image URLs work directly, mirroring the old buckets.
+  await container.createIfNotExists({ access: 'blob' })
+  const blob = container.getBlockBlobClient(filename)
+  await blob.uploadData(optimized, { blobHTTPHeaders: { blobContentType: 'image/webp' } })
 
-  if (error) throw new Error(error.message)
-
-  const {
-    data: { publicUrl },
-  } = supabase.storage.from(bucket).getPublicUrl(filename)
-
-  return publicUrl
+  return blob.url
 }
 
 export async function deleteImage(bucket: string, filename: string): Promise<void> {
-  await supabase.storage.from(bucket).remove([filename])
+  const container = getService().getContainerClient(bucket)
+  await container.deleteBlob(filename).catch(() => {})
 }

@@ -1,11 +1,33 @@
 import { Router, Request, Response } from 'express'
 import { body, validationResult } from 'express-validator'
-import type { User, Session } from '@supabase/supabase-js'
-import { supabase, supabaseAuth } from '../supabase'
+import { randomUUID } from 'crypto'
+import { query, queryOne, uuidParam } from '../db'
+import { hashPassword, verifyPassword } from '../auth/password'
+import { signAccessToken, signRefreshToken, verifyRefreshToken } from '../auth/jwt'
 import { authenticate, AuthRequest } from '../middleware/auth'
 import { authLimiter } from '../middleware/rateLimiter'
 
 const router = Router()
+
+interface ProfileRow {
+  id: string
+  name: string
+  phone: string | null
+  role: string
+  employee_status: string | null
+  email: string | null
+}
+
+function publicUser(p: ProfileRow) {
+  return { id: p.id, name: p.name, phone: p.phone, role: p.role, employee_status: p.employee_status, email: p.email }
+}
+
+function issueTokens(p: ProfileRow) {
+  return {
+    token: signAccessToken({ sub: p.id, email: p.email ?? '', role: p.role }),
+    refreshToken: signRefreshToken(p.id),
+  }
+}
 
 router.post(
   '/register',
@@ -22,46 +44,37 @@ router.post(
 
     const { email, password, name, phone, role = 'customer' } = req.body
 
-    let session: Session | null = null
+    const existing = await queryOne<{ id: string }>(
+      'SELECT id FROM dbo.profiles WHERE email = @email',
+      { email }
+    )
+    if (existing) return res.status(400).json({ error: 'A user with this email already exists' })
 
-    // Create the user pre-confirmed via the admin API: no verification email is
-    // sent (avoids Supabase email rate limits) and no email confirmation step
-    // is needed for either role.
-    const { data: created, error: createErr } = await supabase.auth.admin.createUser({
-      email,
-      password,
-      email_confirm: true,
-      user_metadata: {
+    const id = randomUUID()
+    const passwordHash = await hashPassword(password)
+    const employeeStatus = role === 'employee' ? 'pending' : null
+
+    await query(
+      `INSERT INTO dbo.profiles (id, name, phone, role, employee_status, email, password_hash, created_at, updated_at)
+       VALUES (@id, @name, @phone, @role, @employee_status, @email, @password_hash, SYSDATETIMEOFFSET(), SYSDATETIMEOFFSET())`,
+      {
+        id: uuidParam(id),
         name,
         phone: phone ?? null,
         role,
-        ...(role === 'employee' ? { employee_status: 'pending' } : {}),
-      },
-    })
-    if (createErr) return res.status(400).json({ error: createErr.message })
+        employee_status: employeeStatus,
+        email,
+        password_hash: passwordHash,
+      }
+    )
 
-    const user: User | null = created.user
+    const profile: ProfileRow = { id, name, phone: phone ?? null, role, employee_status: employeeStatus, email }
 
-    // Customers can use the app right away — hand back a session so the web
-    // storefront logs them in immediately after registering. Employees stay
-    // blocked until an admin sets employee_status to 'approved'.
-    if (role === 'customer' && user) {
-      const { data: signIn } = await supabaseAuth.auth.signInWithPassword({ email, password })
-      session = signIn.session ?? null
-    }
-
-    // Sync extra fields to profiles table
-    if (user) {
-      await supabase.from('profiles').upsert({
-        id: user.id,
-        name,
-        phone: phone ?? null,
-        role,
-        ...(role === 'employee' ? { employee_status: 'pending' } : {}),
-      })
-    }
-
-    res.status(201).json({ user, session })
+    // Customers get a session immediately; employees stay pending until approved
+    // (mirrors the old behaviour — but tokens are issued either way, route guards
+    // enforce the pending gate).
+    const tokens = issueTokens(profile)
+    res.status(201).json({ user: publicUser(profile), ...tokens })
   }
 )
 
@@ -75,37 +88,31 @@ router.post(
 
     const { email, password } = req.body
 
-    const { data, error } = await supabaseAuth.auth.signInWithPassword({ email, password })
-    if (error) return res.status(401).json({ error: error.message })
+    const profile = await queryOne<ProfileRow & { password_hash: string | null; active: boolean }>(
+      'SELECT id, name, phone, role, employee_status, email, password_hash, active FROM dbo.profiles WHERE email = @email',
+      { email }
+    )
 
-    const { data: profile } = await supabase
-      .from('profiles')
-      .select('id, name, role, employee_status, phone')
-      .eq('id', data.user.id)
-      .single()
-
-    const metadataRole = data.user.user_metadata?.role as string | undefined
-    let role = profile?.role ?? metadataRole ?? 'customer'
-
-    // Profile can lag after CLI create-superadmin or if enum migration ran late
-    if (metadataRole === 'superadmin' && profile?.role !== 'superadmin') {
-      await supabase
-        .from('profiles')
-        .update({ role: 'superadmin', employee_status: null, updated_at: new Date().toISOString() })
-        .eq('id', data.user.id)
-      role = 'superadmin'
+    if (!profile) return res.status(401).json({ error: 'Invalid email or password' })
+    if (!profile.active) return res.status(403).json({ error: 'This account has been deactivated.' })
+    if (!profile.password_hash) {
+      // Migrated user whose password was never set (Supabase hashes were not
+      // exportable). They must set a password via the reset flow.
+      return res.status(403).json({ error: 'Password not set for this account. Please reset your password.', needsPasswordReset: true })
     }
 
+    const ok = await verifyPassword(password, profile.password_hash)
+    if (!ok) return res.status(401).json({ error: 'Invalid email or password' })
+
+    const tokens = issueTokens(profile)
     res.json({
-      token: data.session.access_token,
-      refreshToken: data.session.refresh_token,
-      user: { ...profile, role, email: data.user.email },
+      ...tokens,
+      user: { id: profile.id, name: profile.name, role: profile.role, employee_status: profile.employee_status, phone: profile.phone, email: profile.email },
     })
   }
 )
 
-// Exchange a refresh token for a fresh access token. Supabase access tokens
-// expire after ~1h; without this the app would 401 and log the user out.
+// Exchange a refresh token for a fresh access + refresh token pair.
 router.post(
   '/refresh',
   authLimiter,
@@ -114,63 +121,62 @@ router.post(
     const errors = validationResult(req)
     if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() })
 
-    const { refreshToken } = req.body
-    const { data, error } = await supabaseAuth.auth.refreshSession({ refresh_token: refreshToken })
-    if (error || !data.session) {
-      return res.status(401).json({ error: error?.message ?? 'Could not refresh session' })
+    let userId: string
+    try {
+      userId = verifyRefreshToken(req.body.refreshToken).sub
+    } catch {
+      return res.status(401).json({ error: 'Could not refresh session' })
     }
 
-    res.json({
-      token: data.session.access_token,
-      refreshToken: data.session.refresh_token,
-    })
+    const profile = await queryOne<ProfileRow>(
+      'SELECT id, name, phone, role, employee_status, email FROM dbo.profiles WHERE id = @id',
+      { id: uuidParam(userId) }
+    )
+    if (!profile) return res.status(401).json({ error: 'Could not refresh session' })
+
+    res.json(issueTokens(profile))
   }
 )
 
-router.post('/logout', authenticate, async (req: AuthRequest, res: Response) => {
-  const token = req.headers.authorization?.replace('Bearer ', '')
-  if (token) await supabase.auth.admin.signOut(token)
+// Stateless JWTs: logout is a client-side token discard. Kept for API parity.
+router.post('/logout', authenticate, async (_req: AuthRequest, res: Response) => {
   res.json({ success: true })
 })
 
 router.get('/me', authenticate, async (req: AuthRequest, res: Response) => {
-  const { data: profile } = await supabase
-    .from('profiles')
-    .select('*')
-    .eq('id', req.user!.id)
-    .single()
-
+  const profile = await queryOne(
+    'SELECT id, name, phone, role, employee_status, fcm_token, whatsapp, email, created_at, updated_at FROM dbo.profiles WHERE id = @id',
+    { id: uuidParam(req.user!.id) }
+  )
   res.json(profile)
 })
 
 router.patch('/me', authenticate, async (req: AuthRequest, res: Response) => {
   const { name, phone, whatsapp } = req.body
-  const updates: Record<string, unknown> = {}
-  if (name) updates.name = name
-  if (phone !== undefined) updates.phone = phone
-  if (whatsapp !== undefined) updates.whatsapp = whatsapp
-  updates.updated_at = new Date().toISOString()
+  const sets: string[] = []
+  const params: Record<string, unknown> = { id: uuidParam(req.user!.id) }
+  if (name) { sets.push('name = @name'); params.name = name }
+  if (phone !== undefined) { sets.push('phone = @phone'); params.phone = phone }
+  if (whatsapp !== undefined) { sets.push('whatsapp = @whatsapp'); params.whatsapp = whatsapp }
+  sets.push('updated_at = SYSDATETIMEOFFSET()')
 
-  const { data, error } = await supabase
-    .from('profiles')
-    .update(updates)
-    .eq('id', req.user!.id)
-    .select()
-    .single()
-
-  if (error) return res.status(400).json({ error: error.message })
-  res.json(data)
+  const updated = await queryOne(
+    `UPDATE dbo.profiles SET ${sets.join(', ')}
+     OUTPUT inserted.id, inserted.name, inserted.phone, inserted.role, inserted.employee_status, inserted.fcm_token, inserted.whatsapp, inserted.email
+     WHERE id = @id`,
+    params
+  )
+  res.json(updated)
 })
 
 router.patch('/push-token', authenticate, async (req: AuthRequest, res: Response) => {
   const { fcmToken } = req.body
   if (!fcmToken) return res.status(400).json({ error: 'fcmToken required' })
 
-  await supabase
-    .from('profiles')
-    .update({ fcm_token: fcmToken, updated_at: new Date().toISOString() })
-    .eq('id', req.user!.id)
-
+  await query(
+    'UPDATE dbo.profiles SET fcm_token = @t, updated_at = SYSDATETIMEOFFSET() WHERE id = @id',
+    { t: fcmToken, id: uuidParam(req.user!.id) }
+  )
   res.json({ success: true })
 })
 
