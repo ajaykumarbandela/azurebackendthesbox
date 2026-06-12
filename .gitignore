@@ -5,7 +5,10 @@ node_modules/
 dist/
 build/
 
-
+# Environment
+.env
+.env.local
+.env.*.local
 
 # Logs
 logs/
