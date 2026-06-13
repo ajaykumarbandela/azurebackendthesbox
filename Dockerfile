@@ -27,7 +27,7 @@ RUN npm ci --omit=dev
 FROM node:22-alpine AS runtime
 WORKDIR /app
 ENV NODE_ENV=production
-ENV PORT=4000
+ENV PORT=4001
 
 # libc6-compat needed at runtime for sharp's native binaries
 RUN apk add --no-cache libc6-compat
@@ -36,6 +36,6 @@ COPY package.json ./
 COPY --from=deps /app/node_modules ./node_modules
 COPY --from=build /app/dist ./dist
 
-EXPOSE 4000
+EXPOSE 4001
 
 CMD ["node", "dist/index.js"]
